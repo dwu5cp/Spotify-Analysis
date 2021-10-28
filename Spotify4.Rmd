@@ -1,0 +1,282 @@
+
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(knitr)
+library(rjson)
+library(purrr)
+library(data.table)
+library(spotifyr)
+library(lubridate)
+library(httpuv)
+library(Rspotify)
+library(kableExtra)
+library(plyr)
+library(wordcloud2)
+  
+```
+
+```{r, include=FALSE}
+###Primary Analysis Function
+Analyze_Data<-function(folder,start_date="2000-01-01",end_date="2100-01-01"){
+  ##Gather Data
+  files<-list.files(folder,full.names = TRUE)
+  file.data<-files[lapply(files,function(x) length(grep("StreamingHistory",x,value=TRUE))) == 1]
+  Listen_DF<-do.call(c,(lapply(file.data,function(x) fromJSON(file=x)))) %>%
+    map(.f=as.data.table) %>% rbindlist(fill=T)
+
+  ##Clean Data 
+  #Manual Corrections
+  Listen_DF[Listen_DF$artistName=="James McAlister",2]<-"Sufjan Stevens"
+  Listen_DF[Listen_DF$artistName=="Selena Gomez & The Scene",2]<-"Selena Gomez"
+  Listen_DF[Listen_DF$artistName=="\"Weird Al\" Yankovic",2]<-"Weird Al Yankovic"
+  
+  #Make Factors and Change Units
+  Listen_DF<-Listen_DF %>% mutate(artistName=as.factor(artistName),
+                           trackName=as.factor(trackName),msPlayed=msPlayed/3600000,
+                           time=as.POSIXct(endTime,tryFormats=c("%Y-%m-%d %H:%M"),tz="UTC"))
+  attributes(Listen_DF$time)$tzone<-"EST5EDT" 
+  Listen_DF<- Listen_DF %>% mutate(hour=hour(time))
+
+  #Fix Column Names
+  colnames(Listen_DF)<-c("endTime","artistName","track","hrPlayed","time","hour")
+  
+  #Apply Filters
+  Data<<-left_join(Listen_DF,(Listen_DF %>% select(track,hrPlayed) %>% 
+                    ddply(c(.(track)),summarize,median=median(hrPlayed)))) %>%
+         mutate(ratio=hrPlayed/median) %>% filter(ratio>=0.4,date(endTime)>date(start_date),
+               date(endTime)<date(end_date),!hour %in% c(3:6))
+  
+  ##Analyze Data
+  #Num for Charts
+  Top_Num<-1:30
+  #Artist Sums
+  Art_Sums<-Data[,c(2,4)] %>% group_by(artistName) %>% 
+      summarize_all(function(x) round(sum(x),1)) %>% arrange(1/hrPlayed)
+  Top_Artists<-Art_Sums[Top_Num,]
+  #Song Sums & counts
+  Song_Sums<-Data[,c(3,4)] %>% group_by(track) %>% summarize_all(sum) %>% arrange(1/hrPlayed)
+  Song_Counts<-count(Data$track) %>% arrange(1/freq) %>% select(tracks=x,count=freq)
+  Top_Song_Counts<-Song_Counts[Top_Num,]
+  #Stats
+  Removed<-dim(Listen_DF)[1]-dim(Data)[1]
+  Total_Listen_Time<<-sum(Data$hrPlayed)
+  Ratio<-sum(Top_Artists$hrPlayed)/Total_Listen_Time
+  Stats<<-list(Removed,Total_Listen_Time,Ratio)
+  
+  ##Output
+  #Combine Data Frames
+  Combined<<-cbind(Top_Num,Top_Artists,Top_Song_Counts)
+  #Table Names
+  Names<-c("","Artist","Hours","Song","Times")
+  #Pretty Kable
+  Table<<-kable(Combined,col.names=Names,table.attr = "style = \"color: black;\"")%>%
+    kable_styling(c("striped","bordered"))%>%
+    kable_styling("striped",full_width=F)%>%
+    add_header_above(c("","Top Artists"=2,"Top Songs"=2))%>%
+    add_header_above(c("Spotify Listening Stats For Total Data Set"=5))
+  #Barplot of Top Artists
+  Top_Art_Time<-Combined[1:15,2:3] %>% mutate(percent=(hrPlayed/Total_Listen_Time)*100)
+  Plot1<-ggplot(Top_Art_Time,aes(x=reorder(artistName,percent),y=percent,fill=artistName))+
+    geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position="none")+
+    ylab("Percent of Total Time")+xlab("Artist")+coord_flip()+
+    geom_text(aes(label=reorder(artistName,percent)),color="black",hjust="inward",
+    vjust= "middle",size=4)+ylim(c(0,max(Top_Art_Time$percent)))+ggtitle("Artist Listen Time")
+  return(list(Table,Plot1))}
+
+###################################################################################
+##General Trends
+General_Use<-function(data){
+  #Add Columns
+  data <- data %>% mutate(year=year(endTime),week=week(endTime),month=month(endTime),
+                         weekday=weekdays(date(endTime)),date=as.Date(endTime))
+  
+  #Analyze Data
+  Daily_Sums<-data %>% select(c(date,hrPlayed)) %>% group_by(date) %>% summarise_all(sum) %>%
+    mutate(weekday=weekdays(date),month=month(date)) %>% within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Week_Sums<-lapply(unique(data$year), 
+                    function(x) filter(data,year==x) %>% select(c(week,hrPlayed)) %>%
+             group_by(week) %>% summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+             map(.f=as.data.table) %>% rbindlist(fill=T)
+  WDay_Sums<-data %>% select(c(weekday,hrPlayed)) %>% group_by(weekday) %>%
+             summarize_all(function(x) round(sum(x),2)) %>% 
+             within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Hour_Sums<-data %>% select(c(hour,hrPlayed)) %>% group_by(hour) %>%
+            summarize_all(function(x) round(sum(x),2))
+  Month_Sums<-lapply(unique(data$year), function(x) filter(data,year==x) %>% 
+              select(c(month,hrPlayed)) %>% group_by(month) %>% 
+              summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+              map(.f=as.data.table) %>% rbindlist(fill=T)
+  
+  #Plot Data
+  list(ggplot(Week_Sums,aes(fill=rainbow(dim(Week_Sums)[1]))) +
+    geom_bar(aes(x=week,y=hrPlayed),stat="identity") + facet_wrap(~year,nrow=2) +
+    theme(legend.position="none") + labs(title="Weekly Listening",x="Week", y="Hours"),
+  ggplot(WDay_Sums,aes(fill=rainbow(dim(WDay_Sums)[1]))) +
+    geom_bar(aes(x=weekday,y=hrPlayed),stat="identity") + theme(legend.position="none")+
+    labs(title="Day of Week Listening", x="Day", y="Hours"),
+  ggplot(Hour_Sums,aes(fill=rainbow(dim(Hour_Sums)[1]))) +
+    geom_bar(aes(x=hour,y=hrPlayed/sum(hrPlayed)),stat="identity") + theme(legend.position="none")+
+    labs(title="Hour of Day Listening", x="Hours", y="Hours"),
+  ggplot(Month_Sums,aes(fill=rainbow(dim(Month_Sums)[1]))) +
+    geom_bar(aes(x=month,y=hrPlayed),stat="identity") + facet_wrap(~year,nrow=2) +
+    theme(legend.position="none") + labs(title="Monthly Listening",x="Month", y="Hours"))
+  }
+
+```
+
+```{r}
+folder<-"MyData"
+#folder<-"Nats_Data"
+
+Analyze_Data(folder)
+General_Use(Data)
+
+Listening_Data<-Data
+save(Listening_Data,file="ListeningData.Rdata")
+
+```
+
+```{r}
+Data<-Data %>% mutate(year=year(as.Date(Data$endTime))) 
+
+Data %>% select(year,hrPlayed) %>% group_by(year) %>% summarize_all(function(x) round(sum(x),1))
+
+Data %>% select(year,artistName,hrPlayed) %>% group_by(year,artistName) %>% summarize_all(function(x) round(sum(x),1)) %>% arrange(1/hrPlayed) %>% group_split(year)
+
+Data %>% select(year,track,hrPlayed) %>% group_by(year,track) %>% summarize_all(function(x) round(sum(x),1)) %>% arrange(1/hrPlayed) %>% group_split(year)
+
+Data %>% select(year,track) %>% group_by(year) %>% count() %>% arrange(1/freq) %>% group_split(year)
+
+```
+
+```{r}
+Data %>% filter(artistName==Combined$artistName[1:10]) %>% mutate(month=month(endTime)) %>%
+    select(artistName,hrPlayed,month,year) %>% group_by(year,month,artistName) %>%
+    summarize_all(function(x) round(sum(x),2)) %>%
+    ggplot() + geom_bar(aes(x=month,y=hrPlayed,fill=artistName),stat="identity") + 
+      facet_wrap(~year,nrow=2) + #theme(legend.position="none") + 
+      labs(title="Monthly Listening",x="Month", y="Hours")
+
+```
+
+
+```{r}
+data <- Data %>% mutate(year=year(endTime),week=week(endTime),month=month(endTime),
+                         weekday=weekdays(date(endTime)),date=as.Date(endTime))
+  
+  #Analyze Data
+  Daily_Sums<-data %>% select(c(date,hrPlayed)) %>% group_by(date) %>% summarise_all(sum) %>%
+    mutate(weekday=weekdays(date),month=month(date)) %>% within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Week_Sums<-lapply(unique(data$year), 
+                    function(x) filter(data,year==x) %>% select(c(week,hrPlayed)) %>%
+             group_by(week) %>% summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+             map(.f=as.data.table) %>% rbindlist(fill=T)
+  WDay_Sums<-data %>% select(c(weekday,hrPlayed)) %>% group_by(weekday) %>%
+             summarize_all(function(x) round(sum(x),2)) %>% 
+             within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Hour_Sums<-data %>% select(c(hour,hrPlayed)) %>% group_by(hour) %>%
+            summarize_all(function(x) round(sum(x),2))
+```
+
+
+```{r}
+artist_sums<- Data %>% select(artistName,hrPlayed) %>% group_by(artistName) %>%
+  summarize_all(sum) %>% arrange(1/hrPlayed)
+
+all %>% select(track_title,album) %>% unique()
+
+
+token<-get_spotify_access_token(client_id = "412fed6ae2164a78a0389b94e2d6fdd7",
+  client_secret = "dd7c0c2b216644a08caecacf6cc76e6c")
+
+artist_data<-(lapply(as.character(artist_sums$artistName[1:10]),function(x) 
+  get_artist_audio_features(x,authorization= token))) %>%
+    map(.f=as.data.table) %>% rbindlist(fill=T)
+
+Data %>% filter(artistName=="Troye Sivan") %>% select(artistName,track) %>% group_by(artistName) %>% count() %>% arrange(1/freq)
+
+```
+
+```{r}
+Tracks<-Data %>% select(track,artistName,hrPlayed) %>% group_by(track,artistName) %>%
+  summarize_all(sum) %>% arrange(1/hrPlayed) %>% 
+  left_join((Data %>% select(track,time=hrPlayed) %>% group_by(track) %>% summarize_all(max))) %>% mutate(plays=hrPlayed/time,tswift=(artistName=="Taylor Swift"))
+
+t.test(data=Tracks, plays~tswift,alternative="less")
+
+ggplot(Tracks,aes(plays,hrPlayed))+geom_point(aes(color=(artistName=="Taylor Swift")))+
+  geom_smooth()+theme(legend.position = "none")
+
+Tracks %>% select(hrPlayed,artistName) %>% group_by(artistName) %>% summarize_all(sum) %>%
+  arrange(1/hrPlayed)
+
+```
+
+
+```{r}
+ #Add Columns
+  data <- copy(Data) %>% 
+  filter(track=="The Yawning Grave") %>%
+  
+  mutate(year=year(endTime),week=week(endTime),month=month(endTime),
+                         weekday=weekdays(date(endTime)),date=as.Date(endTime))
+
+  #Analyze Data
+  Daily_Sums<-data %>% select(c(date,hrPlayed)) %>% group_by(date) %>% summarise_all(sum) %>%
+    mutate(weekday=weekdays(date),month=month(date)) %>% within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Week_Sums<-lapply(unique(data$year), function(x) filter(data,year==x) %>% select(c(week,hrPlayed)) %>%
+             group_by(week) %>% summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+             map(.f=as.data.table) %>% rbindlist(fill=T)
+  WDay_Sums<-data %>% select(c(weekday,hrPlayed)) %>% group_by(weekday) %>%
+             summarize_all(function(x) round(sum(x),2)) %>% 
+             within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Hour_Sums<-data %>% select(c(hour,hrPlayed)) %>% group_by(hour) %>%
+            summarize_all(function(x) round(sum(x),2))
+  Month_Sums<-lapply(unique(data$year), function(x) filter(data,year==x) %>% 
+              select(c(month,hrPlayed)) %>% group_by(month) %>% 
+              summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+              map(.f=as.data.table) %>% rbindlist(fill=T)
+  
+  #Plot Data
+  list(ggplot(Week_Sums,aes(fill=rainbow(dim(Week_Sums)[1]))) +
+    geom_bar(aes(x=week,y=hrPlayed),stat="identity") + facet_wrap(~year,nrow=2) +
+    theme(legend.position="none") + labs(title="Weekly Listening",x="Week", y="Hours"),
+  ggplot(WDay_Sums,aes(fill=rainbow(dim(WDay_Sums)[1]))) +
+    geom_bar(aes(x=weekday,y=hrPlayed),stat="identity") + theme(legend.position="none")+
+    labs(title="Day of Week Listening", x="Day", y="Hours"),
+  ggplot(Hour_Sums,aes(fill=rainbow(dim(Hour_Sums)[1]))) +
+    geom_bar(aes(x=hour,y=hrPlayed/sum(hrPlayed)),stat="identity") + theme(legend.position="none")+
+    labs(title="Hour of Day Listening", x="Hours", y="Hours"),
+  ggplot(Month_Sums,aes(fill=rainbow(dim(Month_Sums)[1]))) +
+    geom_bar(aes(x=month,y=hrPlayed),stat="identity") + facet_wrap(~year,nrow=2) +
+    theme(legend.position="none") + labs(title="Monthly Listening",x="Month", y="Hours"))
+
+ggplot(Daily_Sums,aes(x=hrPlayed,group=weekday,fill=weekday))+geom_density(alpha=0.35)
+
+
+Data %>% select(artistName,hrPlayed) %>% group_by(artistName) %>% summarise_all(sum) %>% arrange(1/hrPlayed)
+
+Data %>% select(track,hrPlayed) %>% group_by(track) %>% summarize_all(max) %>% 
+  left_join(unique(select(Data,track,artistName))) %>% select(artistName,hrPlayed) %>%
+  group_by(artistName) %>% summarise_all(sum) %>% arrange(1/hrPlayed)
+
+Data %>% filter(artistName=="Taylor Swift") %>% select(track,hrPlayed) %>% 
+  group_by(track) %>% summarize_all(sum) %>%
+  ggplot(aes(hrPlayed))+geom_density(fill="blue",alpha=0.25)
+
+check<-left_join(data,(data %>% select(track,hrPlayed) %>%   ddply(c(.(track)),summarize,max=max(hrPlayed)))) %>%
+  mutate(ratio=hrPlayed/max) %>% filter(ratio==1) 
+sum(check$hrPlayed)
+  ggplot(aes(ratio))+geom_density(fill="blue",alpha=0.25)
+
+
+```
+

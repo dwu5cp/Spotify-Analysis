@@ -1,0 +1,419 @@
+---
+title: "Primary Spotify "
+output: html_notebook
+---
+
+##Import Packages
+```{r setup, include=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(knitr)
+library(rjson)
+library(purrr)
+library(data.table)
+library(spotifyr)
+library(lubridate)
+library(httpuv)
+library(Rspotify)
+library(kableExtra)
+library(plyr)
+library(dbplyr)
+library(stringi)
+library(tidyverse) #can we actually do R without it? I'd say no
+library(genius) #we'll need this for the lyrics
+library(tidytext) #for text tidying
+library(ggtextures) #for glittery plots
+library(extrafont) #to add personalizzed fonts to ggplot output
+library(scales) #will be needed for percentage scales in ggplot
+library(widyr) #to find correlations between songs
+library(ggraph) #plotting network maps
+library(igraph) #same
+library(textdata)
+library(GGally)
+library(network)
+library(sna)
+```
+
+#F#unction Storage
+```{r, include=FALSE}
+Get_Auth<-function(my_id){
+  clientID = "412fed6ae2164a78a0389b94e2d6fdd7"
+  secret = "dd7c0c2b216644a08caecacf6cc76e6c"
+  auth<<-spotifyOAuth(app_id="XYZ",client_id=clientID,client_secret=secret)
+  return(auth)}
+
+###Primary Analysis Function
+Analyze_Data<-function(folder,start_date="2000-01-01",end_date="2100-01-01"){
+  ##Gather Data
+  files<-list.files(folder,full.names = TRUE)
+  file.data<-files[lapply(files,function(x) length(grep("StreamingHistory",x,value=TRUE))) == 1]
+  Listen_DF<-do.call(c,(lapply(file.data,function(x) fromJSON(file=x)))) %>%
+    map(.f=as.data.table) %>% rbindlist(fill=T)
+
+  ##Clean Data 
+  #Manual Corrections
+  Listen_DF[Listen_DF$artistName=="James McAlister",2]<-"Sufjan Stevens"
+  Listen_DF[Listen_DF$artistName=="Selena Gomez & The Scene",2]<-"Selena Gomez"
+  Listen_DF[Listen_DF$artistName=="\"Weird Al\" Yankovic",2]<-"Weird Al Yankovic"
+  
+  #Make Factors and Change Units
+  Listen_DF<-Listen_DF %>% mutate(artistName=as.factor(artistName),
+                                  trackName=as.factor(trackName),msPlayed=msPlayed/3600000,
+                                  time=as.POSIXct(endTime,tryFormats=c("%Y-%m-%d %H:%M"),tz="UTC"))
+  attributes(Listen_DF$time)$tzone<-"EST5EDT" 
+  Listen_DF<- Listen_DF %>% mutate(hour=hour(time))
+
+  #Fix Column Names
+  colnames(Listen_DF)<-c("endTime","artistName","track","hrPlayed","time","hour")
+  
+  #Apply Filters
+  Data<<-left_join(Listen_DF,(Listen_DF %>% select(track,hrPlayed) %>% 
+                    ddply(c(.(track)),summarize,max=max(hrPlayed)))) %>%
+         mutate(ratio=hrPlayed/max) %>% filter(ratio>=0.1,date(endTime)>date(start_date),
+               date(endTime)<date(end_date),!hour %in% c(3:6))
+  
+  ##Analyze Data
+  #Num for Charts
+  Top_Num<-1:30
+  #Artist Sums
+  Art_Sums<-Data[,c(2,4)] %>% group_by(artistName) %>% 
+      summarize_all(function(x) round(sum(x),1)) %>% arrange(1/hrPlayed)
+  Top_Artists<-Art_Sums[Top_Num,]
+  #Song Sums & counts
+  Song_Sums<-Data[,c(3,4)] %>% group_by(track) %>% summarize_all(sum) %>% arrange(1/hrPlayed)
+  Song_Counts<-count(Data$track) %>% arrange(1/freq) %>% select(tracks=x,count=freq)
+  Top_Song_Counts<-Song_Counts[Top_Num,]
+  #Stats
+  Removed<-dim(Listen_DF)[1]-dim(Data)[1]
+  Total_Listen_Time<<-sum(Data$hrPlayed)
+  Ratio<-sum(Top_Artists$hrPlayed)/Total_Listen_Time
+  Stats<<-list(Removed,Total_Listen_Time,Ratio)
+  
+  ##Output
+  #Combine Data Frames
+  Combined<<-cbind(Top_Num,Top_Artists,Top_Song_Counts)
+  #Table Names
+  Names<-c("","Artist","Hours","Song","Times")
+  #Pretty Kable
+  Table<<-kable(Combined,col.names=Names)%>%
+    kable_styling(c("striped","bordered"))%>%
+    kable_styling("striped",full_width=F)%>%
+    add_header_above(c("","Top Artists"=2,"Top Songs"=2))%>%
+    add_header_above(c("Spotify Listening Stats For Total Data Set"=5))
+  #Barplot of Top Artists
+  Top_Art_Time<-Combined[1:15,2:3] %>% mutate(percent=(hrPlayed/Total_Listen_Time)*100)
+  Plot1<-ggplot(Top_Art_Time,aes(x=reorder(artistName,percent),y=percent,fill=artistName))+
+    geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position="none")+
+    ylab("Percent of Total Time")+xlab("Artist")+coord_flip()+
+    geom_text(aes(label=reorder(artistName,percent)),color="black",hjust="inward",
+    vjust= "middle",size=4)+ylim(c(0,max(Top_Art_Time$percent)))+ggtitle("Artist Listen Time")
+  return(list(Table,Plot1))}
+
+###################################################################################
+##General Trends
+General_Use<-function(data){
+  #Add Columns
+  data <- data %>% mutate(year=year(endTime),week=week(endTime),month=month(endTime),
+                         weekday=weekdays(date(endTime)),date=as.Date(endTime))
+  
+  #Analyze Data
+  Daily_Sums<-data %>% select(c(date,hrPlayed)) %>% group_by(date) %>% summarise_all(sum) %>%
+    mutate(weekday=weekdays(date),month=month(date)) %>% within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Week_Sums<-lapply(unique(data$year), 
+                    function(x) filter(data,year==x) %>% select(c(week,hrPlayed)) %>%
+             group_by(week) %>% summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+             map(.f=as.data.table) %>% rbindlist(fill=T)
+  WDay_Sums<-data %>% select(c(weekday,hrPlayed)) %>% group_by(weekday) %>%
+             summarize_all(function(x) round(sum(x),2)) %>% 
+             within(weekday <- factor(weekday, 
+             levels=c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")))
+  Hour_Sums<-data %>% select(c(hour,hrPlayed)) %>% group_by(hour) %>%
+            summarize_all(function(x) round(sum(x),2))
+  Month_Sums<-lapply(unique(data$year), function(x) filter(data,year==x) %>% 
+              select(c(month,hrPlayed)) %>% group_by(month) %>% 
+              summarize_all(function(y) round(sum(y),2)) %>% data.frame(year=x)) %>%
+              map(.f=as.data.table) %>% rbindlist(fill=T)
+  
+  #Plot Data
+  list(ggplot(Week_Sums,aes(fill=rainbow(dim(Week_Sums)[1]))) +
+    geom_bar(aes(x=week,y=hrPlayed),stat="identity") + facet_wrap(~year,nrow=2) +
+    theme(legend.position="none") + labs(title="Weekly Listening",x="Week", y="Hours"),
+  ggplot(WDay_Sums,aes(fill=rainbow(dim(WDay_Sums)[1]))) +
+    geom_bar(aes(x=weekday,y=hrPlayed),stat="identity") + theme(legend.position="none")+
+    labs(title="Day of Week Listening", x="Day", y="Hours"),
+  ggplot(Hour_Sums,aes(fill=rainbow(dim(Hour_Sums)[1]))) +
+    geom_bar(aes(x=hour,y=hrPlayed/sum(hrPlayed)),stat="identity") + theme(legend.position="none")+
+    labs(title="Hour of Day Listening", x="Hours", y="Hours"),
+  ggplot(Month_Sums,aes(fill=rainbow(dim(Month_Sums)[1]))) +
+    geom_bar(aes(x=month,y=hrPlayed),stat="identity") + facet_wrap(~year,nrow=2) +
+    theme(legend.position="none") + labs(title="Monthly Listening",x="Month", y="Hours"))
+  }
+
+
+# More Complicated Stuff in terms of combining scraping and data file analysis
+Further_Analysis<-function(x){
+  Top_Art_Time<-Sorted[1:10,1:2]
+  ggplot(Top_Art_Time,aes(x=reorder(Top_Artists,V1),y=V1,fill=Top_Artists))+
+    geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position="none")+
+    ylab("Percent of Total Time")+xlab("Artist")+coord_flip()+
+    geom_text(aes(label=reorder(Top_Artists,V1)),color="black",hjust="inward",vjust=            "middle",size=4)+ylim(c(0,220))+ylab("Hours")+xlab("Artist")+
+    ggtitle("Artist Listen Time")
+  Art_Genre<-lapply(Top_Artists, function(x)
+    unlist(strsplit(searchArtist(x,Get_Auth(my_id))[1,]$genre, ","))[1])
+  Art_Genre[str_detect(Art_Genre,"pop")]="pop"
+  Art_Genre[str_detect(Art_Genre,"rock")]="rock"
+  Art_Genre[str_detect(Art_Genre,"hop")]="hop"
+  Art_Genre[str_detect(Art_Genre,"country")]="country"
+  art_sum<-(summary(as.factor(unlist(Art_Genre))))
+  df_art_sums<<-data.frame(cbind(labels(art_sum),(art_sum)))
+  genre_sums<-data.frame(cbind(replace_na(unlist(Art_Genre),"None"),unname(summary(as.factor(unlist(artists)))[1:40])))
+  genre_sums$X2<-as.integer(genre_sums$X2)
+  Genre_Sums<<-aggregate(X2~X1,data=genre_sums,FUN=sum)
+  Genres<-ggplot(df_art_sums,aes(x="",y=art_sum,fill=labels(art_sum)))+
+    geom_bar(width=1,stat="identity")+coord_polar("y", start=0)+
+    theme_void()+ggtitle("Top Artist Genres")+scale_fill_discrete(name="Genre")
+  list(Percent.Total,Genres,Art_Genre)}
+
+All_Playlists<-function(auth,my_id,graphs=TRUE){
+  Plist<<-get_user_playlists(my_id,limit = 50, 
+  offset=0,authorization=auth,include_meta_info=F)
+  raw_tracks<-lapply(1:(dim(Plist)[1]), function(x)
+    rbindlist(map(lapply((0:(floor(Plist$tracks.total[1])/100))*100,
+    function(y) get_playlist_tracks(Plist$id[x],limit=100,
+    offset=y,authorization=auth$credentials$access_token)),data.frame),fill=T))
+  pre_tracks<-rbindlist(map((raw_tracks),as.data.table),fill=T)
+  tracks<<-pre_tracks %>% distinct(track.id,.keep_all=T)
+  track_id<-(tracks$track.id)
+  pre_features<-lapply(1:round(length(track_id)[1]/100), 
+      function(x) get_track_audio_features(track_id[((x-1)*100+1):(100*x)],
+      authorization=auth$credentials$access_token))
+  raw_artists<-(lapply(1:length(track_id), function(x)
+    (tracks$track.artists[[x]])$name))
+  artists<<-rbindlist(map(raw_artists,as.data.table),fill=T)
+  features<-rbindlist(map(pre_features,as.data.table),fill=T)
+  colnames(tracks)[colnames(tracks)=="track.uri"] <- "uri"
+  tracks2<- tracks%>%
+    left_join(features, by="uri")
+  tracks2<<-tracks2[!duplicated(tracks2$track.name),]
+
+  # Artist/Genre Stuff
+  Top_Artists_Playlist<<-data.frame("X"=labels(summary(as.factor(unlist(artists)))[1:40]))
+  Top_Artists_Playlist$X<-as.character(Top_Artists_Playlist$X)
+  Top_Artists_Playlist$X<<-stri_trans_general(str=Top_Artists_Playlist$X,id = "Latin-ASCII")
+  Art_Genre<<-lapply(Top_Artists_Playlist$X, function(x)
+      tryCatch(unlist(strsplit(searchArtist((x),auth)[1,]$genre, ","))[1], error=function(e)        NULL))
+  Art_Genre[str_detect(Art_Genre,"pop")]="pop"
+  Art_Genre[str_detect(Art_Genre,"rock")]="rock"
+  Art_Genre[str_detect(Art_Genre,"hop")]="hop"
+  Art_Genre[str_detect(Art_Genre,"country")]="country"
+  Art_Genre[str_detect(Art_Genre,"indie")]="indie"
+  art_sum<-(summary(as.factor(unlist(Art_Genre))))
+  df_art_sums<<-data.frame(cbind(labels(art_sum),(art_sum)))
+  genre_sums<-data.frame(cbind(replace_na(unlist(Art_Genre),"None"),unname(summary(as.factor(unlist(artists)))[1:40])))
+  genre_sums$X2<-as.integer(genre_sums$X2)
+  Genre_Sums<<-aggregate(X2~X1,data=genre_sums,FUN=sum)
+  
+  # Return Graphs
+  list(ggplot(df_art_sums,aes(x="",y=art_sum,fill=labels(art_sum)))+
+    geom_bar(width=1,stat="identity")+coord_polar("y", start=0)+
+    theme_void()+ggtitle("Top Artist Genres")+scale_fill_discrete(name="Genre"),
+    ggplot(Genre_Sums,aes(x="",y=X2,fill=X1))+geom_bar(width=1,stat="identity")+
+      coord_polar("y", start=0)+theme_void()+ggtitle("Top Artist Genres Weighted")+
+      scale_fill_discrete(name="Genre"),
+    ggplot(tracks2,aes(x=tempo))+geom_density(fill='blue',alpha=0.25),
+  ggplot(tracks2,aes(x=duration_ms/60000))+geom_density(fill='red',alpha=0.3)+
+    xlab("duration")+xlim(c(0,7)),
+  ggplot(tracks2,aes(x=danceability))+geom_density(fill='green',alpha=0.25),
+  ggplot(tracks2,aes(x=loudness))+geom_density(fill='pink',alpha=0.5),
+  ggplot(tracks2,aes(x=track.popularity))+geom_density(fill='orange',alpha=0.4),
+  ggplot(tracks2,aes(x=liveness))+geom_density(fill='orchid',alpha=0.4),
+  ggplot(tracks2,aes(x=energy))+geom_density(fill='cyan',alpha=0.4),
+  ggplot(tracks2,aes(x=valence))+geom_density(fill='aquamarine',alpha=0.4))}
+
+```
+
+##Run Code
+#Playlist Data
+```{r}
+#Set-up for API
+my_id<-"faghp4wundh648ufgowaaexb9"
+auth<-Get_Auth(my_id)
+
+#Run Function
+All_Playlists(Get_Auth(my_id),my_id)
+
+```
+
+#Listening Data
+```{r}
+folder<-"MyData"
+Analyze_Data(folder)
+General_Use(Data)
+
+Listening_Data<-Data
+save(Listening_Data,file="ListeningData.Rdata")
+
+```
+
+```{r}
+Analyze_Data("Nats_Data")
+General_Use(Data)
+
+```
+
+```{r}
+Data %>% filter(track=="The Yawning Grave")
+
+```
+
+
+#Compare Data
+```{r}
+Play.Art<-data.frame(Counts=unname(summary(as.factor(artists$V1))[1:10]))
+Play.Art$Artist<-labels(summary(as.factor(artists$V1))[1:10])
+Play.Art$Percent<-(Play.Art$Counts/dim(tracks2)[1])*100 
+ggplot(Play.Art,aes(x=reorder(Artist,Percent),y=Percent,fill=Artist))+
+  geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position = "none")+
+  ylab("Percent of Total Library")+xlab("Artist")+coord_flip()+
+  geom_text(aes(label=reorder(Artist,Percent)),color="black",hjust="inward",vjust="center", size=4)+ylim(c(0,20))+ggtitle("Artists as Percent of Songs in Library")
+
+Top_Art_Time<-Sorted[1:10,1:2]
+Top_Art_Time$V1<-(Top_Art_Time$V1/Stats[2])*100
+ggplot(Top_Art_Time,aes(x=reorder(Top_Artists,V1),y=V1,fill=Top_Artists))+
+  geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position="none")+
+  ylab("Percent of Total Time")+xlab("Artist")+coord_flip()+
+  geom_text(aes(label=reorder(Top_Artists,V1)),color="black",hjust="inward",vjust= "middle",size=4)+ylim(c(0,30))+ylab("Percent")+xlab("Artist")+
+  ggtitle("Artist as Percent of Listening Time")
+
+Plist_Tracks<-copy(tracks2)
+Top_Info<-filter(Plist_Tracks,Plist_Tracks$track.name %in% Top_Songs)
+ggplot(Top_Info,aes(x=tempo))+geom_density(fill='blue',alpha=0.25)
+ggplot(Top_Info,aes(x=duration_ms/60000))+geom_density(fill='red',alpha=0.3)+
+  xlab("duration")
+ggplot(Top_Info,aes(x=danceability))+geom_density(fill='green',alpha=0.25)
+ggplot(Top_Info,aes(x=loudness))+geom_density(fill='pink',alpha=0.5)
+ggplot(Top_Info,aes(x=track.popularity))+geom_density(fill='orange',alpha=0.4)
+ggplot(Top_Info,aes(x=liveness))+geom_density(fill='orchid',alpha=0.4)
+ggplot(Top_Info,aes(x=energy))+geom_density(fill='cyan',alpha=0.4)
+ggplot(Top_Info,aes(x=valence))+geom_density(fill='aquamarine',alpha=0.4)
+```
+
+#Listening Time By Hour
+```{r}
+Hours<-data.frame(Hours=as.factor(0:23))
+data<-Data
+data$Hour<-as.factor(hour(data$endTime))
+H_Sums<-data.frame(transpose((lapply(Hours$Hours,function(x)
+      (sum(filter(data,data$Hour==x)$msPlayed)/3600000/Stats[2]*100)))))
+Hour_Sums<-data.frame(Hour=Hours$Hours,Sums=H_Sums)
+
+ggplot(Hour_Sums,aes(x=Hour,y=Hour_Sums[,2],fill=Hour))+geom_bar(stat="identity")+ylab("Percent of Total Time")+xlab("Hour")+theme(legend.position="none")+ggtitle("Listening By Hour")
+```
+
+#Daily Listening Data By Month
+```{r}
+Week.Day_Totals<-function(data){
+data$Week.Day<-(wday(data$endTime))
+Week.Day<<-data
+Week.Day_Sums<-data.frame(Week.Day=unique(wday(Data$endTime)),                      Week.Day.Sum=unlist(cbind(lapply(unique(wday(data$endTime)),function(x) 
+  sum(filter(data,data$Week.Day==x)$msPlayed))))/3600000)
+ggplot(Week.Day_Sums,aes(x=Week.Day,y=Week.Day.Sum,fill=rainbow(length(Week.Day))))+
+  geom_bar(stat="identity")+theme(legend.position="none")+labs(title="Week Days")}
+
+data<-Data
+data$Month<-(month(data$endTime))
+lapply(c(1:4,8:12),function(x)
+  filter(data,data$Month==x)%>%Week.Day_Totals())
+
+```
+
+#Listening Data By Month
+```{r}
+data<-Data
+data$Month<-(month(data$endTime))
+Week.Month<<-data
+Month_Sums<-data.frame(Month=unique(month(Data$endTime)),                      Month.Sum=unlist(cbind(lapply(unique(month(data$endTime)),function(x) 
+  sum(filter(data,data$Month==x)$msPlayed))))/3600000/Stats[2]*100)
+ggplot(Month_Sums,aes(x=Month,y=Month.Sum,fill=rainbow(length(Month))))+
+  geom_bar(stat="identity")+theme(legend.position="none")+labs(title="Months")
+```
+
+#TSwift
+```{r}
+Art_DF<-filter(Data,Data$artistName=="Taylor Swift")
+Top_Num<-1:20
+Top_Song_Counts<-(summary(factor(Art_DF$trackName))[(Top_Num)])
+Top_Songs<-labels(Top_Song_Counts)
+Art_Top_Songs<-data.frame(Top_Song_Counts)
+Total_Time<<-sum(Art_DF$msPlayed)/3600000
+
+Sums<-cbind(unlist(lapply(Top_Songs,function(x) sum(filter(Listening_Data,Listening_Data$trackName==x)$msPlayed)))/3600000)
+Top_TSwift<-data.frame(Songs=Top_Songs,Sums,Counts=Top_Song_Counts)
+
+
+Names<-c("","Song","Hours","Times")
+kable(cbind(Top_Num,Top_Songs,round(Sums,2),cbind(data.frame(X=Top_Song_Counts[Top_Num])$X)),col.names=Names)%>%
+  kable_styling(c("striped","bordered"))%>%
+  kable_styling("striped",full_width=F)%>%
+  add_header_above(c("","Top Songs"=3))
+
+ggplot(Top_TSwift,aes(x=reorder(Songs,Sums),y=Sums,fill=Songs))+
+  geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position="none")+
+  coord_flip()+geom_text(aes(label=reorder(Songs,Sums)),color="black",hjust="inward",vjust= "middle",size=4)+ylim(c(0,max(Top_TSwift$Sums)))+ylab("Hours")+xlab("Song")+
+  ggtitle("TSwift Top Song Listen Time")
+
+ggplot(Top_TSwift,aes(x=reorder(Songs,Counts),y=Counts,fill=Songs))+
+  geom_bar(stat="identity")+theme(axis.text.y=element_blank(),legend.position="none")+
+  coord_flip()+geom_text(aes(label=reorder(Songs,Counts)),color="black",hjust="inward",vjust= "middle",size=4)+ylim(c(0,max(Top_TSwift$Counts)))+ylab("Hours")+xlab("Song")+
+  ggtitle("TSwift Top Song Listen Counts")
+
+```
+
+#Artist Discography Analysis
+```{r}
+Mel<-get_artist_audio_features("Melanie Martinez",authorization = token) 
+TayTay<-get_artist_audio_features("Taylor Swift",authorization = token)
+Selena<-rbind(get_artist_audio_features("Selena Gomez",authorization = token),
+              get_artist_audio_features("Selena Gomez & The Scene",authorization = token))
+Elton<-get_artist_audio_features("Elton John",authorization = token) 
+Gaga<-get_artist_audio_features("Lady Gaga",authorization = token) 
+Kishi<-get_artist_audio_features("Kishi Bashi",authorization = token) 
+
+ggplot()+geom_density(data=Selena,aes(x=duration_ms/60000),fill="red",alpha=0.4)+
+  geom_density(data=TayTay,aes(x=duration_ms/60000),fill="purple",alpha=0.2)+
+  geom_density(data=Gaga,aes(x=duration_ms/60000),fill="blue",alpha=0.4)+
+  geom_density(data=Mel,aes(x=duration_ms/60000),fill="green",alpha=0.4)
+  geom_density(data=Elton,aes(x=duration_ms/60000),fill="orange",alpha=0.4)
+
+ggplot()+geom_density(data=Selena,aes(x=valence),fill="red",alpha=0.4)+
+  geom_density(data=TayTay,aes(x=valence),fill="purple",alpha=0.2)+
+  geom_density(data=Gaga,aes(x=valence),fill="blue",alpha=0.4)+
+  geom_density(data=Mel,aes(x=valence),fill="green",alpha=0.4)+
+  geom_density(data=Elton,aes(x=valence),fill="orange",alpha=0.4)
+
+ggplot()+geom_density(data=Selena,aes(x=tempo),fill="red",alpha=0.4)+
+  geom_density(data=TayTay,aes(x=tempo),fill="purple",alpha=0.2)+
+  geom_density(data=Gaga,aes(x=tempo),fill="blue",alpha=0.4)+
+  geom_density(data=Mel,aes(x=tempo),fill="green",alpha=0.4)+
+  geom_density(data=Elton,aes(x=tempo),fill="orange",alpha=0.4)+xlim(c(50,200))
+
+ggplot()+geom_density(data=Selena,aes(x=liveness),fill="red",alpha=0.4)+
+  geom_density(data=TayTay,aes(x=liveness),fill="purple",alpha=0.2)+
+  geom_density(data=Gaga,aes(x=liveness),fill="blue",alpha=0.4)+
+  geom_density(data=Mel,aes(x=liveness),fill="green",alpha=0.4)+
+  geom_density(data=Elton,aes(x=liveness),fill="orange",alpha=0.4)
+
+ggplot()+geom_density(data=Selena,aes(x=loudness),fill="red",alpha=0.4)+
+  geom_density(data=TayTay,aes(x=loudness),fill="purple",alpha=0.2)+
+  geom_density(data=Gaga,aes(x=loudness),fill="blue",alpha=0.4)+
+  geom_density(data=Mel,aes(x=loudness),fill="green",alpha=0.4)+
+  geom_density(data=Elton,aes(x=loudness),fill="orange",alpha=0.4)
+
+ggplot()+geom_density(data=Selena,aes(x=energy),fill="red",alpha=0.4)+
+  geom_density(data=TayTay,aes(x=energy),fill="purple",alpha=0.2)+
+  geom_density(data=Gaga,aes(x=energy),fill="blue",alpha=0.4)+
+  geom_density(data=Mel,aes(x=energy),fill="green",alpha=0.4)+
+  geom_density(data=Elton,aes(x=energy),fill="orange",alpha=0.4)
+```
+
